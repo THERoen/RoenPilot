@@ -1,9 +1,10 @@
-import math
-import numpy as np
+from math import radians
+from numpy import pi
 from collections import deque
 
 from cereal import log
 from openpilot.selfdrive.car.interfaces import FRICTION_THRESHOLD, get_friction_threshold
+from openpilot.common.numpy_fast import clip, interp
 from openpilot.selfdrive.controls.lib.drive_helpers import MIN_SPEED, get_friction
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl, MIN_LATERAL_CONTROL_SPEED
@@ -49,9 +50,9 @@ class LatControlTorque(LatControl):
     self.lat_accel_request_buffer_len = int(LAT_ACCEL_REQUEST_BUFFER_SECONDS / self.dt)
     self.lat_accel_request_buffer = deque([0.] * self.lat_accel_request_buffer_len , maxlen=self.lat_accel_request_buffer_len)
     self.lookahead_frames = int(JERK_LOOKAHEAD_SECONDS / self.dt)
-    self.jerk_filter = FirstOrderFilter(0.0, 1 / (2 * np.pi * LP_FILTER_CUTOFF_HZ), self.dt)
+    self.jerk_filter = FirstOrderFilter(0.0, 1 / (2 * pi * LP_FILTER_CUTOFF_HZ), self.dt)
     self.previous_measurement = 0.0
-    self.measurement_rate_filter = FirstOrderFilter(0.0, 1 / (2 * np.pi * (MAX_LAT_JERK_UP - 0.5)), self.dt)
+    self.measurement_rate_filter = FirstOrderFilter(0.0, 1 / (2 * pi * (MAX_LAT_JERK_UP - 0.5)), self.dt)
     self.low_speed_reset_threshold = max(CP.minSteerSpeed, MIN_LATERAL_CONTROL_SPEED)
 
   def update_live_torque_params(self, latAccelFactor, latAccelOffset, friction):
@@ -75,28 +76,29 @@ class LatControlTorque(LatControl):
       self.measurement_rate_filter.x = 0.0
       self.lat_accel_request_buffer = deque([0.] * self.lat_accel_request_buffer_len , maxlen=self.lat_accel_request_buffer_len)
     else:
-      measured_curvature = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
+      measured_curvature = -VM.calc_curvature(radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
       roll_compensation = params.roll * ACCELERATION_DUE_TO_GRAVITY
-      curvature_deadzone = abs(VM.calc_curvature(math.radians(self.steering_angle_deadzone_deg), CS.vEgo, 0.0))
-      lateral_accel_deadzone = curvature_deadzone * CS.vEgo ** 2
+      curvature_deadzone = abs(VM.calc_curvature(radians(self.steering_angle_deadzone_deg), CS.vEgo, 0.0))
+      lateral_accel_deadzone = curvature_deadzone * CS.vEgo * CS.vEgo
 
-      delay_frames = int(np.clip(lat_delay / self.dt, 1, self.lat_accel_request_buffer_len))
+      delay_frames = int(clip(lat_delay / self.dt, 1, self.lat_accel_request_buffer_len))
       expected_lateral_accel = self.lat_accel_request_buffer[-delay_frames]
-      future_desired_lateral_accel = desired_curvature * CS.vEgo ** 2
+      future_desired_lateral_accel = desired_curvature * CS.vEgo * CS.vEgo
       self.lat_accel_request_buffer.append(future_desired_lateral_accel)
       raw_lateral_jerk = (future_desired_lateral_accel - expected_lateral_accel) / max(lat_delay, self.dt)
-      raw_lateral_jerk = np.clip(raw_lateral_jerk, -MAX_LAT_JERK_UP, MAX_LAT_JERK_UP)
-      desired_lateral_jerk = np.clip(self.jerk_filter.update(raw_lateral_jerk), -MAX_LAT_JERK_UP, MAX_LAT_JERK_UP)
+      raw_lateral_jerk = clip(raw_lateral_jerk, -MAX_LAT_JERK_UP, MAX_LAT_JERK_UP)
+      desired_lateral_jerk = clip(self.jerk_filter.update(raw_lateral_jerk), -MAX_LAT_JERK_UP, MAX_LAT_JERK_UP)
       gravity_adjusted_future_lateral_accel = future_desired_lateral_accel - roll_compensation
       setpoint = expected_lateral_accel + desired_lateral_jerk * lat_delay
 
-      measurement = measured_curvature * CS.vEgo ** 2
+      measurement = measured_curvature * CS.vEgo * CS.vEgo
       measurement_rate = self.measurement_rate_filter.update((measurement - self.previous_measurement) / self.dt)
-      measurement_rate = np.clip(measurement_rate, -MAX_LAT_JERK_UP, MAX_LAT_JERK_UP)
+      measurement_rate = clip(measurement_rate, -MAX_LAT_JERK_UP, MAX_LAT_JERK_UP)
       self.previous_measurement = measurement
 
-      low_speed_factor = (np.interp(CS.vEgo, LOW_SPEED_X, LOW_SPEED_Y) / max(CS.vEgo, MIN_SPEED)) ** 2
-      current_kp = np.interp(CS.vEgo, self.pid._k_p[0], self.pid._k_p[1])
+      lsfinterp = interp(CS.vEgo, LOW_SPEED_X, LOW_SPEED_Y) / max(CS.vEgo, MIN_SPEED)
+      low_speed_factor = lsfinterp * lsfinterp
+      current_kp = interp(CS.vEgo, self.pid._k_p[0], self.pid._k_p[1])
       error = setpoint - measurement
       error_with_lsf = error * (1 + low_speed_factor / max(current_kp, 1e-3))
 
